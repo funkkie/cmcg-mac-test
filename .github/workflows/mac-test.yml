@@ -1,0 +1,9 @@
+name: mac-test
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Open SSH session
+        uses: mxschmitt/action-tmate@v3
