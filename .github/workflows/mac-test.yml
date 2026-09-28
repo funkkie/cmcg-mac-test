@@ -1,9 +1,77 @@
-name: mac-test
+name: mac-test-x11
 on: workflow_dispatch
+
 jobs:
   test:
     runs-on: macos-14
     timeout-minutes: 340
     steps:
-      - name: Setup upterm session
+      - name: Install XQuartz (X server for Xvfb)
+        run: brew install --cask xquartz
+
+      - name: Cache MacPorts + Wine build
+        id: cache-macports
+        uses: actions/cache@v4
+        with:
+          path: /opt/local
+          key: macports-wine-x11-v1
+
+      - name: Install MacPorts
+        if: steps.cache-macports.outputs.cache-hit != 'true'
+        run: |
+          curl -LO https://github.com/macports/macports-base/releases/download/v2.10.5/MacPorts-2.10.5-14-Sonoma.pkg
+          sudo installer -pkg MacPorts-2.10.5-14-Sonoma.pkg -target /
+
+      - name: Install Wine via MacPorts
+        if: steps.cache-macports.outputs.cache-hit != 'true'
+        run: |
+          export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+          sudo port -N install wine
+        timeout-minutes: 300
+
+      - name: Start virtual display (Xvfb)
+        run: |
+          export PATH="/opt/X11/bin:$PATH"
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 5
+
+      - name: Init wine prefix (force X11 driver, skip mac driver)
+        env:
+          DISPLAY: ":99"
+          WINE_NO_MAC_DRIVER: "1"
+        run: |
+          export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+          export WINEPREFIX=$HOME/.wine-test
+          unset WINEARCH
+          wineboot --init
+          sleep 10
+
+      - name: Launch Notepad under Wine (GUI smoke test)
+        env:
+          DISPLAY: ":99"
+          WINE_NO_MAC_DRIVER: "1"
+        run: |
+          export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+          export WINEPREFIX=$HOME/.wine-test
+          wine notepad &
+          sleep 15
+
+      - name: Capture screenshot of virtual display
+        run: |
+          export PATH="/opt/X11/bin:$PATH"
+          brew install imagemagick
+          xwd -root -display :99 -out /tmp/screen.xwd
+          convert /tmp/screen.xwd /tmp/screen.png
+
+      - name: Upload screenshot as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-x11-test-screenshot
+          path: /tmp/screen.png
+
+      - name: Setup upterm session (backup for manual debugging)
+        if: always()
         uses: owenthereal/action-upterm@v1
+        with:
+          wait-timeout-minutes: 5
