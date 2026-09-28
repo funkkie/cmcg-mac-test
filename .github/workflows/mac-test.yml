@@ -39,8 +39,13 @@ jobs:
         id: findsrc
         run: |
           export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
-          TARBALL=$(find /opt/local/var/macports/distfiles/wine -name "wine-*.tar.xz" | head -1)
+          TARBALL=$(find /opt/local/var/macports/distfiles -iname "wine-*.tar.xz" 2>/dev/null | head -1)
           echo "Found: $TARBALL"
+          if [ -z "$TARBALL" ]; then
+            echo "ERROR: no wine source tarball found under distfiles"
+            find /opt/local/var/macports/distfiles -maxdepth 1 -type d
+            exit 1
+          fi
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 
       - name: Build Wine from source with X11 driver enabled
