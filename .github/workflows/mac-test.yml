@@ -65,7 +65,7 @@ jobs:
             --with-x \
             --x-includes=/opt/X11/include \
             --x-libraries=/opt/X11/lib \
-            --without-mingw 2>&1 | tee ~/configure.log
+            2>&1 | tee ~/configure.log
           make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee ~/make.log
           make install 2>&1 | tee ~/make-install.log
         timeout-minutes: 300
