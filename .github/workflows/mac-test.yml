@@ -35,6 +35,15 @@ jobs:
           export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
           sudo port -N install bison flex pkgconfig
 
+      - name: Install llvm-mingw toolchain (PE cross-compiler for aarch64 host)
+        run: |
+          TAG=$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
+          echo "Using llvm-mingw tag: $TAG"
+          curl -L -o llvm-mingw.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-macos-universal.tar.xz"
+          mkdir -p ~/llvm-mingw
+          tar xf llvm-mingw.tar.xz -C ~/llvm-mingw --strip-components=1
+          echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
+
       - name: Locate Wine source tarball already fetched by MacPorts
         id: findsrc
         run: |
@@ -58,7 +67,7 @@ jobs:
         env:
           PKG_CONFIG_PATH: /opt/local/lib/pkgconfig
         run: |
-          export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+          export PATH="$HOME/llvm-mingw/bin:/opt/local/bin:/opt/local/sbin:$PATH"
           mkdir -p ~/wine-src && cd ~/wine-src
           tar xf "${{ steps.findsrc.outputs.tarball }}" --strip-components=1
           ./configure --prefix=$HOME/wine-x11 \
