@@ -39,10 +39,16 @@ jobs:
         id: findsrc
         run: |
           export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
-          TARBALL=$(find /opt/local/var/macports/distfiles -iname "wine-*.tar.xz" 2>/dev/null | head -1)
+          TARBALL=$(find /opt/local/var/macports/distfiles/wine -type f \( -iname "*.tar.xz" -o -iname "*.tar.gz" -o -iname "*.tar.bz2" \) 2>/dev/null | head -1)
+          if [ -z "$TARBALL" ]; then
+            TARBALL=$(find /opt/local/var/macports/distfiles -type f -iname "wine-*" 2>/dev/null | head -1)
+          fi
           echo "Found: $TARBALL"
           if [ -z "$TARBALL" ]; then
-            echo "ERROR: no wine source tarball found under distfiles"
+            echo "ERROR: no wine source tarball found"
+            echo "== contents of distfiles/wine =="
+            find /opt/local/var/macports/distfiles/wine -type f 2>/dev/null
+            echo "== all distfiles dirs =="
             find /opt/local/var/macports/distfiles -maxdepth 1 -type d
             exit 1
           fi
