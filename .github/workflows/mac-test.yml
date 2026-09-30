@@ -79,6 +79,13 @@ jobs:
           make install 2>&1 | tee ~/make-install.log
         timeout-minutes: 300
 
+      - name: Ad-hoc code-sign Wine binaries (required on Apple Silicon)
+        run: |
+          echo "Signing executables and libraries under $HOME/wine-x11 ..."
+          find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null \
+            | xargs -0 -I{} codesign --force -s - "{}" 2>/dev/null || true
+          echo "Done signing."
+
       - name: Upload build logs (always, for debugging)
         if: always()
         uses: actions/upload-artifact@v4
