@@ -79,12 +79,32 @@ jobs:
           make install 2>&1 | tee ~/make-install.log
         timeout-minutes: 300
 
-      - name: Ad-hoc code-sign Wine binaries (required on Apple Silicon)
+      - name: Ad-hoc code-sign Wine binaries with JIT entitlements (required on Apple Silicon)
         run: |
+          cat > "$HOME/wine-entitlements.plist" << 'PLIST_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.cs.allow-jit</key><true/>
+              <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+              <key>com.apple.security.cs.disable-executable-page-protection</key><true/>
+              <key>com.apple.security.cs.disable-library-validation</key><true/>
+              <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+          </dict>
+          </plist>
+          PLIST_EOF
+          echo "Entitlements file:"
+          cat "$HOME/wine-entitlements.plist"
           echo "Signing executables and libraries under $HOME/wine-x11 ..."
-          find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null \
-            | xargs -0 -I{} codesign --force -s - "{}" 2>/dev/null || true
-          echo "Done signing."
+          COUNT=0
+          while IFS= read -r -d '' f; do
+            codesign --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
+            COUNT=$((COUNT+1))
+          done < <(find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
+          echo "Signed $COUNT files."
+          echo "Verifying wineboot signature:"
+          codesign -d --entitlements - "$HOME/wine-x11/bin/wineboot" 2>&1 || true
 
       - name: Upload build logs (always, for debugging)
         if: always()
