@@ -37,9 +37,23 @@ jobs:
 
       - name: Install llvm-mingw toolchain (PE cross-compiler for aarch64 host)
         run: |
-          TAG=$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
+          LATEST_URL=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/mstorsjo/llvm-mingw/releases/latest)
+          TAG=$(basename "$LATEST_URL")
+          if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
+            echo "ERROR: could not resolve latest llvm-mingw tag (got: '$TAG')"
+            exit 1
+          fi
           echo "Using llvm-mingw tag: $TAG"
-          curl -L -o llvm-mingw.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-macos-universal.tar.xz"
+          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-macos-universal.tar.xz"
+          echo "Downloading: $URL"
+          curl -L -o llvm-mingw.tar.xz "$URL"
+          FILESIZE=$(stat -f%z llvm-mingw.tar.xz)
+          echo "Downloaded file size: $FILESIZE bytes"
+          if [ "$FILESIZE" -lt 1000000 ]; then
+            echo "ERROR: downloaded file too small, likely not a real archive:"
+            cat llvm-mingw.tar.xz
+            exit 1
+          fi
           mkdir -p ~/llvm-mingw
           tar xf llvm-mingw.tar.xz -C ~/llvm-mingw --strip-components=1
           echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
