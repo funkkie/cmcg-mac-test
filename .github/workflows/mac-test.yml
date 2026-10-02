@@ -116,7 +116,14 @@ jobs:
             codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
             COUNT=$((COUNT+1))
           done < <(find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
-          echo "Signed $COUNT files."
+          echo "Signed $COUNT files under wine-x11."
+          echo "Also signing MacPorts shared libraries under /opt/local/lib (dependencies wine dyld-loads) ..."
+          LIBCOUNT=0
+          while IFS= read -r -d '' f; do
+            codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
+            LIBCOUNT=$((LIBCOUNT+1))
+          done < <(find /opt/local/lib /opt/X11/lib -type f -name "*.dylib" -print0 2>/dev/null)
+          echo "Signed $LIBCOUNT MacPorts/X11 dylibs."
           echo "Verifying wineboot signature (need CS_RUNTIME flag + entitlements):"
           codesign -d --entitlements - --verbose=4 "$HOME/wine-x11/bin/wineboot" 2>&1 || true
 
@@ -144,7 +151,20 @@ jobs:
           export PATH="$HOME/wine-x11/bin:$PATH"
           export WINEPREFIX=$HOME/.wine-test
           unset WINEARCH
+          set +e
           wineboot --init
+          STATUS=$?
+          set -e
+          echo "wineboot exit status: $STATUS"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "=== codesign --verify --deep on wine binary ==="
+            codesign --verify --deep --strict --verbose=4 "$HOME/wine-x11/bin/wine" 2>&1 || true
+            echo "=== spctl assessment ==="
+            spctl -a -vv "$HOME/wine-x11/bin/wine" 2>&1 || true
+            echo "=== Recent unified system log mentioning wine / amfid / code signature (last 3 min) ==="
+            log show --last 3m --info --debug --predicate 'eventMessage contains[c] "wine" or process == "amfid" or eventMessage contains[c] "amfid" or eventMessage contains[c] "code signature" or eventMessage contains[c] "Trust evaluate" or eventMessage contains[c] "killed" or eventMessage contains[c] "Sandbox"' 2>&1 | tail -300 || echo "log show produced nothing or failed"
+            exit $STATUS
+          fi
           sleep 10
 
       - name: Launch Notepad under Wine (GUI smoke test)
