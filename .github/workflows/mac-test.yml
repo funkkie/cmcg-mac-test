@@ -109,6 +109,7 @@ jobs:
           [ext]
           basicConstraints=critical,CA:true
           keyUsage=critical,keyCertSign,digitalSignature
+          extendedKeyUsage=critical,codeSigning
           CNF_EOF
 
           openssl req -x509 -newkey rsa:2048 -keyout "$HOME/signkey.pem" -out "$HOME/signcert.pem" -days 3650 -nodes -config "$HOME/csr.cnf"
@@ -117,11 +118,8 @@ jobs:
 
           security import "$HOME/signcert.p12" -k "$KEYCHAIN" -P "$PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
 
-          # NOTE: deliberately NOT running "security add-trusted-cert" against the System keychain here.
-          # That requires GUI authorization and hangs forever on a headless runner (this is what made
-          # the previous run stall for 30+ minutes). AMFI's "no certificate chain found" complaint is
-          # about whether codesign embeds *a* certificate in the signature at all, not about whether
-          # macOS Gatekeeper trusts it - importing into our own keychain is enough for that.
+          # Trust it within our OWN keychain only (not System.keychain - that needs GUI auth and hangs headlessly).
+          security add-trusted-cert -d -r trustRoot -k "$KEYCHAIN" "$HOME/signcert.pem"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$KEYCHAIN"
 
           EXISTING=$(security list-keychains -d user | tr -d '"')
@@ -133,6 +131,8 @@ jobs:
           IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep "WineLocalSigning" | head -1 | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([A-F0-9]+)[[:space:]].*/\1/')
           if [ -z "$IDENTITY_HASH" ]; then
             echo "ERROR: could not find WineLocalSigning identity hash"
+            echo "=== cert details ==="
+            openssl x509 -in "$HOME/signcert.pem" -text -noout | head -40
             exit 1
           fi
           echo "Using identity hash: $IDENTITY_HASH"
