@@ -113,12 +113,12 @@ jobs:
           echo "Signing executables and libraries under $HOME/wine-x11 ..."
           COUNT=0
           while IFS= read -r -d '' f; do
-            codesign --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
+            codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
             COUNT=$((COUNT+1))
           done < <(find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
           echo "Signed $COUNT files."
-          echo "Verifying wineboot signature:"
-          codesign -d --entitlements - "$HOME/wine-x11/bin/wineboot" 2>&1 || true
+          echo "Verifying wineboot signature (need CS_RUNTIME flag + entitlements):"
+          codesign -d --entitlements - --verbose=4 "$HOME/wine-x11/bin/wineboot" 2>&1 || true
 
       - name: Upload build logs (always, for debugging)
         if: always()
