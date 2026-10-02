@@ -69,10 +69,6 @@ jobs:
           echo "Found: $TARBALL"
           if [ -z "$TARBALL" ]; then
             echo "ERROR: no wine source tarball found"
-            echo "== contents of distfiles/wine =="
-            find /opt/local/var/macports/distfiles/wine -type f 2>/dev/null
-            echo "== all distfiles dirs =="
-            find /opt/local/var/macports/distfiles -maxdepth 1 -type d
             exit 1
           fi
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
@@ -93,7 +89,54 @@ jobs:
           make install 2>&1 | tee ~/make-install.log
         timeout-minutes: 300
 
-      - name: Code-sign Wine binaries (entitlements only on main executables, never on libraries)
+      - name: Create local self-signed code-signing identity
+        id: cert
+        run: |
+          KEYCHAIN="$HOME/sign.keychain-db"
+          PASSWORD="actions"
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+
+          cat > "$HOME/csr.cnf" << 'CNF_EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = ext
+          prompt = no
+          [dn]
+          CN = WineLocalSigning
+          [ext]
+          basicConstraints=critical,CA:true
+          keyUsage=critical,keyCertSign,digitalSignature
+          CNF_EOF
+
+          openssl req -x509 -newkey rsa:2048 -keyout "$HOME/signkey.pem" -out "$HOME/signcert.pem" -days 3650 -nodes -config "$HOME/csr.cnf"
+          openssl pkcs12 -export -out "$HOME/signcert.p12" -inkey "$HOME/signkey.pem" -in "$HOME/signcert.pem" -passout "pass:$PASSWORD" -legacy 2>/dev/null || \
+            openssl pkcs12 -export -out "$HOME/signcert.p12" -inkey "$HOME/signkey.pem" -in "$HOME/signcert.pem" -passout "pass:$PASSWORD"
+
+          security import "$HOME/signcert.p12" -k "$KEYCHAIN" -P "$PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$HOME/signcert.pem"
+          security add-trusted-cert -d -r trustRoot -k "$KEYCHAIN" "$HOME/signcert.pem"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$KEYCHAIN"
+
+          EXISTING=$(security list-keychains -d user | tr -d '"')
+          security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+
+          echo "=== find-identity (codesigning) ==="
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep "WineLocalSigning" | head -1 | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([A-F0-9]+)[[:space:]].*/\1/')
+          if [ -z "$IDENTITY_HASH" ]; then
+            echo "ERROR: could not find WineLocalSigning identity hash"
+            exit 1
+          fi
+          echo "Using identity hash: $IDENTITY_HASH"
+          echo "identity=$IDENTITY_HASH" >> "$GITHUB_OUTPUT"
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Code-sign Wine binaries (self-signed identity + entitlements on main executables only, ad-hoc on libraries)
         run: |
           cat > "$HOME/wine-entitlements.plist" << 'PLIST_EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -108,29 +151,27 @@ jobs:
           </dict>
           </plist>
           PLIST_EOF
-          echo "Entitlements file:"
-          cat "$HOME/wine-entitlements.plist"
-          echo "AMFI forbids entitlements on anything that is not a main (Mach-O executable) binary:"
-          echo "shared libraries / builtin-dll .so shims (e.g. ntdll.so) must be signed WITHOUT entitlements,"
-          echo "only real executables (wine, wine64, wineserver, the unix loader under lib/wine/<arch>/) get them."
-          echo "Classifying and signing files under $HOME/wine-x11 ..."
+          IDENTITY="${{ steps.cert.outputs.identity }}"
+          KEYCHAIN="${{ steps.cert.outputs.keychain }}"
+          echo "Signing with identity: $IDENTITY (keychain: $KEYCHAIN)"
+          echo "Only main Mach-O executables get entitlements; libraries/builtin-dll shims get a plain signature (AMFI forbids entitlements on non-main binaries)."
           EXECCOUNT=0
           LIBCOUNT=0
           while IFS= read -r -d '' f; do
             TYPE=$(file -b "$f" 2>/dev/null)
             if echo "$TYPE" | grep -q "executable"; then
-              codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
+              codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s "$IDENTITY" --keychain "$KEYCHAIN" "$f" 2>&1 | grep -v "replacing existing signature" || true
               EXECCOUNT=$((EXECCOUNT+1))
             else
-              codesign --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
+              codesign --options runtime --force -s "$IDENTITY" --keychain "$KEYCHAIN" "$f" 2>&1 | grep -v "replacing existing signature" || true
               LIBCOUNT=$((LIBCOUNT+1))
             fi
           done < <(find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
-          echo "Signed $EXECCOUNT main executables WITH entitlements."
-          echo "Signed $LIBCOUNT libraries/builtin-dlls WITHOUT entitlements (ad-hoc only)."
-          echo "Verifying wineboot signature (need CS_RUNTIME flag + entitlements):"
-          codesign -d --entitlements - --verbose=4 "$HOME/wine-x11/bin/wineboot" 2>&1 || true
-          echo "Verifying ntdll.so has NO entitlements (must not be a constraint violation):"
+          echo "Signed $EXECCOUNT main executables WITH entitlements (identity: $IDENTITY)."
+          echo "Signed $LIBCOUNT libraries/builtin-dlls WITHOUT entitlements (same identity, no entitlements)."
+          echo "Verifying wine signature (need a real cert chain now, not adhoc):"
+          codesign -dvvv "$HOME/wine-x11/bin/wine" 2>&1 || true
+          echo "Verifying ntdll.so has NO entitlements:"
           codesign -d --entitlements - --verbose=4 "$HOME/wine-x11/lib/wine/aarch64-unix/ntdll.so" 2>&1 || true
 
       - name: Upload build logs (always, for debugging)
@@ -163,8 +204,8 @@ jobs:
           set -e
           echo "wineboot exit status: $STATUS"
           if [ "$STATUS" -ne 0 ]; then
-            echo "=== Recent unified system log mentioning wine / amfid / constraint violation (last 3 min) ==="
-            log show --last 3m --info --debug --predicate 'eventMessage contains[c] "wine" or process == "amfid" or eventMessage contains[c] "amfid" or eventMessage contains[c] "constraint violation" or eventMessage contains[c] "code signature"' 2>&1 | tail -300 || echo "log show produced nothing or failed"
+            echo "=== Recent unified system log mentioning wine / amfid / constraint violation / certificate chain (last 3 min) ==="
+            log show --last 3m --info --debug --predicate 'eventMessage contains[c] "wine" or process == "amfid" or eventMessage contains[c] "amfid" or eventMessage contains[c] "constraint violation" or eventMessage contains[c] "certificate chain"' 2>&1 | tail -300 || echo "log show produced nothing or failed"
             exit $STATUS
           fi
           sleep 10
