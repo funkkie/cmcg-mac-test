@@ -93,7 +93,7 @@ jobs:
           make install 2>&1 | tee ~/make-install.log
         timeout-minutes: 300
 
-      - name: Ad-hoc code-sign Wine binaries with JIT entitlements (required on Apple Silicon)
+      - name: Code-sign Wine binaries (entitlements only on main executables, never on libraries)
         run: |
           cat > "$HOME/wine-entitlements.plist" << 'PLIST_EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -110,22 +110,28 @@ jobs:
           PLIST_EOF
           echo "Entitlements file:"
           cat "$HOME/wine-entitlements.plist"
-          echo "Signing executables and libraries under $HOME/wine-x11 ..."
-          COUNT=0
-          while IFS= read -r -d '' f; do
-            codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
-            COUNT=$((COUNT+1))
-          done < <(find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
-          echo "Signed $COUNT files under wine-x11."
-          echo "Also signing MacPorts shared libraries under /opt/local/lib (dependencies wine dyld-loads) ..."
+          echo "AMFI forbids entitlements on anything that is not a main (Mach-O executable) binary:"
+          echo "shared libraries / builtin-dll .so shims (e.g. ntdll.so) must be signed WITHOUT entitlements,"
+          echo "only real executables (wine, wine64, wineserver, the unix loader under lib/wine/<arch>/) get them."
+          echo "Classifying and signing files under $HOME/wine-x11 ..."
+          EXECCOUNT=0
           LIBCOUNT=0
           while IFS= read -r -d '' f; do
-            codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
-            LIBCOUNT=$((LIBCOUNT+1))
-          done < <(find /opt/local/lib /opt/X11/lib -type f -name "*.dylib" -print0 2>/dev/null)
-          echo "Signed $LIBCOUNT MacPorts/X11 dylibs."
+            TYPE=$(file -b "$f" 2>/dev/null)
+            if echo "$TYPE" | grep -q "executable"; then
+              codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
+              EXECCOUNT=$((EXECCOUNT+1))
+            else
+              codesign --force -s - "$f" 2>&1 | grep -v "replacing existing signature" || true
+              LIBCOUNT=$((LIBCOUNT+1))
+            fi
+          done < <(find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
+          echo "Signed $EXECCOUNT main executables WITH entitlements."
+          echo "Signed $LIBCOUNT libraries/builtin-dlls WITHOUT entitlements (ad-hoc only)."
           echo "Verifying wineboot signature (need CS_RUNTIME flag + entitlements):"
           codesign -d --entitlements - --verbose=4 "$HOME/wine-x11/bin/wineboot" 2>&1 || true
+          echo "Verifying ntdll.so has NO entitlements (must not be a constraint violation):"
+          codesign -d --entitlements - --verbose=4 "$HOME/wine-x11/lib/wine/aarch64-unix/ntdll.so" 2>&1 || true
 
       - name: Upload build logs (always, for debugging)
         if: always()
@@ -157,12 +163,8 @@ jobs:
           set -e
           echo "wineboot exit status: $STATUS"
           if [ "$STATUS" -ne 0 ]; then
-            echo "=== codesign --verify --deep on wine binary ==="
-            codesign --verify --deep --strict --verbose=4 "$HOME/wine-x11/bin/wine" 2>&1 || true
-            echo "=== spctl assessment ==="
-            spctl -a -vv "$HOME/wine-x11/bin/wine" 2>&1 || true
-            echo "=== Recent unified system log mentioning wine / amfid / code signature (last 3 min) ==="
-            log show --last 3m --info --debug --predicate 'eventMessage contains[c] "wine" or process == "amfid" or eventMessage contains[c] "amfid" or eventMessage contains[c] "code signature" or eventMessage contains[c] "Trust evaluate" or eventMessage contains[c] "killed" or eventMessage contains[c] "Sandbox"' 2>&1 | tail -300 || echo "log show produced nothing or failed"
+            echo "=== Recent unified system log mentioning wine / amfid / constraint violation (last 3 min) ==="
+            log show --last 3m --info --debug --predicate 'eventMessage contains[c] "wine" or process == "amfid" or eventMessage contains[c] "amfid" or eventMessage contains[c] "constraint violation" or eventMessage contains[c] "code signature"' 2>&1 | tail -300 || echo "log show produced nothing or failed"
             exit $STATUS
           fi
           sleep 10
