@@ -124,7 +124,7 @@ jobs:
           # hung runs #19 and #21; this unflagged form does not touch system trust settings and
           # should not require authorization. Guarded by the step's 3-minute timeout regardless,
           # in case this assumption is wrong on this runner.
-          security add-trusted-cert -r trustRoot -p codeSigning -k "$KEYCHAIN" "$HOME/signcert.pem" || \
+          security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$HOME/signcert.pem" || \
             echo "WARNING: add-trusted-cert (user domain) failed or was not permitted; continuing anyway"
 
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$KEYCHAIN"
