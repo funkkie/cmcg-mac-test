@@ -9,12 +9,19 @@ jobs:
       - name: Install XQuartz (X server + X11 dev headers)
         run: brew install --cask xquartz
 
-      - name: Cache MacPorts + deps
+      - name: Restore MacPorts cache
         id: cache-macports
         uses: actions/cache/restore@v4
         with:
           path: /opt/local
           key: macports-wine-x11-v2
+
+      - name: Restore built Wine cache
+        id: cache-wine
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/wine-x11
+          key: wine-x11-build-v1
 
       - name: Install MacPorts
         if: steps.cache-macports.outputs.cache-hit != 'true'
@@ -29,7 +36,7 @@ jobs:
           sudo port -N install wine bison flex pkgconfig
         timeout-minutes: 300
 
-      - name: Save MacPorts cache early (so later failures do not lose it)
+      - name: Save MacPorts cache early
         if: steps.cache-macports.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -37,12 +44,13 @@ jobs:
           key: macports-wine-x11-v2
 
       - name: Ensure build tools present (cache-hit path)
-        if: steps.cache-macports.outputs.cache-hit == 'true'
+        if: steps.cache-macports.outputs.cache-hit == 'true' && steps.cache-wine.outputs.cache-hit != 'true'
         run: |
           export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
           sudo port -N install bison flex pkgconfig
 
       - name: Install llvm-mingw toolchain (PE cross-compiler for aarch64 host)
+        if: steps.cache-wine.outputs.cache-hit != 'true'
         run: |
           LATEST_URL=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/mstorsjo/llvm-mingw/releases/latest)
           TAG=$(basename "$LATEST_URL")
@@ -52,13 +60,11 @@ jobs:
           fi
           echo "Using llvm-mingw tag: $TAG"
           URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-macos-universal.tar.xz"
-          echo "Downloading: $URL"
           curl -L -o llvm-mingw.tar.xz "$URL"
           FILESIZE=$(stat -f%z llvm-mingw.tar.xz)
           echo "Downloaded file size: $FILESIZE bytes"
           if [ "$FILESIZE" -lt 1000000 ]; then
-            echo "ERROR: downloaded file too small, likely not a real archive:"
-            cat llvm-mingw.tar.xz
+            echo "ERROR: downloaded file too small"
             exit 1
           fi
           mkdir -p ~/llvm-mingw
@@ -66,9 +72,9 @@ jobs:
           echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
 
       - name: Locate Wine source tarball already fetched by MacPorts
+        if: steps.cache-wine.outputs.cache-hit != 'true'
         id: findsrc
         run: |
-          export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
           TARBALL=$(find /opt/local/var/macports/distfiles/wine -type f \( -iname "*.tar.xz" -o -iname "*.tar.gz" -o -iname "*.tar.bz2" \) 2>/dev/null | head -1)
           if [ -z "$TARBALL" ]; then
             TARBALL=$(find /opt/local/var/macports/distfiles -type f -iname "wine-*" 2>/dev/null | head -1)
@@ -81,6 +87,7 @@ jobs:
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 
       - name: Build Wine from source with X11 driver enabled
+        if: steps.cache-wine.outputs.cache-hit != 'true'
         env:
           PKG_CONFIG_PATH: /opt/local/lib/pkgconfig
         run: |
@@ -96,103 +103,76 @@ jobs:
           make install 2>&1 | tee ~/make-install.log
         timeout-minutes: 300
 
+      - name: Save built Wine cache early
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/wine-x11
+          key: wine-x11-build-v1
+
       - name: Start virtual display (Xvfb)
         run: |
           export PATH="/opt/X11/bin:$PATH"
           Xvfb :99 -screen 0 1024x768x24 &
           sleep 5
 
-      - name: Try several code-signing strategies, keep the first where wineboot works
-        timeout-minutes: 20
+      - name: DIAGNOSE why wine gets SIGKILL on this runner
+        continue-on-error: true
+        timeout-minutes: 10
         env:
           DISPLAY: ":99"
           WINE_NO_MAC_DRIVER: "1"
         run: |
-          cat > "$HOME/ents-full.plist" << 'PLIST_EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>com.apple.security.cs.allow-jit</key><true/>
-              <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
-              <key>com.apple.security.cs.disable-executable-page-protection</key><true/>
-              <key>com.apple.security.cs.disable-library-validation</key><true/>
-              <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
-          </dict>
-          </plist>
-          PLIST_EOF
+          echo "##### system"
+          sw_vers; uname -a
+          csrutil status 2>&1 || true
+          spctl --status 2>&1 || true
+          nvram boot-args 2>&1 || true
+          sysctl kern.bootargs 2>&1 || true
 
-          sign_all() {
-            MODE="$1"
-            find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
-              TYPE=$(file -b "$f" 2>/dev/null)
-              ISEXEC=0
-              if echo "$TYPE" | grep -q "executable"; then ISEXEC=1; fi
-              case "$MODE" in
-                plain)
-                  codesign --force -s - "$f" >/dev/null 2>&1 || true ;;
-                ents_noruntime)
-                  if [ "$ISEXEC" = "1" ]; then
-                    codesign --force --entitlements "$HOME/ents-full.plist" -s - "$f" >/dev/null 2>&1 || true
-                  else
-                    codesign --force -s - "$f" >/dev/null 2>&1 || true
-                  fi ;;
-                ents_runtime)
-                  if [ "$ISEXEC" = "1" ]; then
-                    codesign --force --options runtime --entitlements "$HOME/ents-full.plist" -s - "$f" >/dev/null 2>&1 || true
-                  else
-                    codesign --force -s - "$f" >/dev/null 2>&1 || true
-                  fi ;;
-              esac
-            done
-          }
-
-          try_wine() {
-            export PATH="$HOME/wine-x11/bin:$PATH"
-            export WINEPREFIX="$HOME/.wine-try"
-            rm -rf "$WINEPREFIX"
-            unset WINEARCH
-            wineboot --init > "$HOME/wineboot-try.log" 2>&1 &
-            WPID=$!
-            ( sleep 150; kill -9 $WPID 2>/dev/null ) &
-            WD=$!
-            wait $WPID
-            RC=$?
-            kill $WD 2>/dev/null
-            echo "wineboot exit code: $RC"
-            tail -20 "$HOME/wineboot-try.log"
-            return $RC
-          }
-
-          CHOSEN=""
-          for MODE in plain ents_noruntime ents_runtime; do
-            echo "=================== STRATEGY: $MODE ==================="
-            sign_all "$MODE"
-            codesign -dvv "$HOME/wine-x11/bin/wine" 2>&1 | head -12 || true
-            if try_wine; then
-              echo "SUCCESS with strategy: $MODE"
-              CHOSEN="$MODE"
-              break
-            fi
-            echo "--- strategy $MODE failed; kernel/amfid log: ---"
-            log show --last 2m --info --debug --predicate 'process == "amfid" or process == "taskgated-helper" or eventMessage contains[c] "constraint violation" or eventMessage contains[c] "wine"' 2>&1 | grep -iE "wine|violation|not valid|disallow|AMFI" | tail -25 || true
+          echo "##### sign everything plain ad-hoc"
+          find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
+            codesign --force -s - "$f" >/dev/null 2>&1 || true
           done
-          if [ -z "$CHOSEN" ]; then
-            echo "ERROR: no signing strategy let wineboot run"
-            exit 1
-          fi
-          echo "Chosen strategy: $CHOSEN"
+          codesign -dvv "$HOME/wine-x11/bin/wine" 2>&1 | head -8
 
-      - name: Upload build logs (always, for debugging)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wine-build-logs
-          path: |
-            ~/configure.log
-            ~/make.log
-            ~/make-install.log
-            ~/wineboot-try.log
+          echo "##### Mach-O load commands (pagezero / segments) of wine binaries"
+          file "$HOME/wine-x11/bin/wine" "$HOME/wine-x11/lib/wine/aarch64-unix/wine" "$HOME/wine-x11/lib/wine/aarch64-unix/ntdll.so"
+          otool -l "$HOME/wine-x11/lib/wine/aarch64-unix/wine" | grep -A6 -E "LC_SEGMENT_64" | grep -E "segname|vmaddr|vmsize|maxprot|initprot" | head -40
+
+          echo "##### test: tiny C program with RWX mmap and fixed 4GB mmap, ad-hoc signed"
+          cat > "$HOME/t.c" << 'CEOF'
+          #include <sys/mman.h>
+          #include <stdio.h>
+          int main(void){
+            void *p = mmap(0,16384,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANON,-1,0);
+            printf("rwx mmap: %p\n", p);
+            void *q = mmap((void*)0x100000000ULL,16384,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0);
+            printf("fixed 4GB mmap: %p\n", q);
+            return 0;
+          }
+          CEOF
+          cc -o "$HOME/t" "$HOME/t.c" && codesign --force -s - "$HOME/t" && "$HOME/t"; echo "tiny test rc=$?"
+
+          echo "##### test: wine --version (loader only)"
+          "$HOME/wine-x11/bin/wine" --version; echo "wine --version rc=$?"
+
+          echo "##### test: MacPorts own wine (built locally, same runner)"
+          ls -la /opt/local/bin | grep -i wine || true
+          MPW=$(ls /opt/local/bin/wine* 2>/dev/null | head -1)
+          echo "MacPorts wine: $MPW"
+          if [ -n "$MPW" ]; then "$MPW" --version; echo "macports wine --version rc=$?"; fi
+
+          echo "##### test: lldb launch wine --version to capture stop reason"
+          lldb -b -o "run" -o "thread info" -o "bt 8" -o "process status" -- "$HOME/wine-x11/bin/wine" --version 2>&1 | tail -40 || true
+
+          echo "##### test: wine with WINEDEBUG and strace-like via DYLD_PRINT_LIBRARIES"
+          DYLD_PRINT_LIBRARIES=1 "$HOME/wine-x11/bin/wine" --version 2>&1 | tail -15; echo "rc=$?"
+
+          echo "##### kernel log"
+          log show --last 3m --info --debug --predicate 'process == "kernel"' 2>&1 | grep -iE "wine|AMFI|signature|Killed|proc exec|exec of|policy|taskgated|^.*deny" | tail -40 || true
+          echo "##### taskgated / syspolicyd log"
+          log show --last 3m --info --debug --predicate 'process == "taskgated-helper" or process == "syspolicyd" or process == "amfid"' 2>&1 | grep -iE "wine|t\.c|/Users/runner/t" | tail -30 || true
 
       - name: Init wine prefix (force X11 driver, disable mac driver)
         timeout-minutes: 3
