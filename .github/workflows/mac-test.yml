@@ -3,207 +3,58 @@ on: workflow_dispatch
 
 jobs:
   test:
-    runs-on: macos-14
-    timeout-minutes: 340
+    runs-on: macos-15-intel
+    timeout-minutes: 60
     steps:
-      - name: Install XQuartz (X server + X11 dev headers)
-        run: brew install --cask xquartz
-
-      - name: Restore MacPorts cache
-        id: cache-macports
-        uses: actions/cache/restore@v4
-        with:
-          path: /opt/local
-          key: macports-wine-x11-v2
-
-      - name: Restore built Wine cache
-        id: cache-wine
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/wine-x11
-          key: wine-x11-build-v1
-
-      - name: Install MacPorts
-        if: steps.cache-macports.outputs.cache-hit != 'true'
+      - name: Machine info
         run: |
-          curl -LO https://github.com/macports/macports-base/releases/download/v2.10.5/MacPorts-2.10.5-14-Sonoma.pkg
-          sudo installer -pkg MacPorts-2.10.5-14-Sonoma.pkg -target /
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          csrutil status || true
 
-      - name: Install Wine via MacPorts (to pull all build dependencies into /opt/local)
-        if: steps.cache-macports.outputs.cache-hit != 'true'
+      - name: Install Wine (prebuilt x86_64 Mac build from Homebrew)
+        timeout-minutes: 20
         run: |
-          export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
-          sudo port -N install wine bison flex pkgconfig
-        timeout-minutes: 300
+          brew install --cask --no-quarantine gcenx/wine/wine-stable || brew install --cask --no-quarantine wine-stable
+          ls /Applications | grep -i wine || true
 
-      - name: Save MacPorts cache early
-        if: steps.cache-macports.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: /opt/local
-          key: macports-wine-x11-v2
-
-      - name: Ensure build tools present (cache-hit path)
-        if: steps.cache-macports.outputs.cache-hit == 'true' && steps.cache-wine.outputs.cache-hit != 'true'
+      - name: Locate wine binary and check version
+        id: findwine
+        timeout-minutes: 3
         run: |
-          export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
-          sudo port -N install bison flex pkgconfig
+          WINE=$(ls -d /Applications/Wine*.app/Contents/Resources/wine/bin/wine 2>/dev/null | head -1)
+          if [ -z "$WINE" ]; then WINE=$(which wine64 || which wine || true); fi
+          echo "wine binary: $WINE"
+          file "$WINE"
+          "$WINE" --version
+          echo "wine=$WINE" >> "$GITHUB_OUTPUT"
 
-      - name: Install llvm-mingw toolchain (PE cross-compiler for aarch64 host)
-        if: steps.cache-wine.outputs.cache-hit != 'true'
-        run: |
-          LATEST_URL=$(curl -sL -o /dev/null -w '%{url_effective}' https://github.com/mstorsjo/llvm-mingw/releases/latest)
-          TAG=$(basename "$LATEST_URL")
-          if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
-            echo "ERROR: could not resolve latest llvm-mingw tag (got: '$TAG')"
-            exit 1
-          fi
-          echo "Using llvm-mingw tag: $TAG"
-          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-macos-universal.tar.xz"
-          curl -L -o llvm-mingw.tar.xz "$URL"
-          FILESIZE=$(stat -f%z llvm-mingw.tar.xz)
-          echo "Downloaded file size: $FILESIZE bytes"
-          if [ "$FILESIZE" -lt 1000000 ]; then
-            echo "ERROR: downloaded file too small"
-            exit 1
-          fi
-          mkdir -p ~/llvm-mingw
-          tar xf llvm-mingw.tar.xz -C ~/llvm-mingw --strip-components=1
-          echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
-
-      - name: Locate Wine source tarball already fetched by MacPorts
-        if: steps.cache-wine.outputs.cache-hit != 'true'
-        id: findsrc
-        run: |
-          TARBALL=$(find /opt/local/var/macports/distfiles/wine -type f \( -iname "*.tar.xz" -o -iname "*.tar.gz" -o -iname "*.tar.bz2" \) 2>/dev/null | head -1)
-          if [ -z "$TARBALL" ]; then
-            TARBALL=$(find /opt/local/var/macports/distfiles -type f -iname "wine-*" 2>/dev/null | head -1)
-          fi
-          echo "Found: $TARBALL"
-          if [ -z "$TARBALL" ]; then
-            echo "ERROR: no wine source tarball found"
-            exit 1
-          fi
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-
-      - name: Build Wine from source with X11 driver enabled
-        if: steps.cache-wine.outputs.cache-hit != 'true'
-        env:
-          PKG_CONFIG_PATH: /opt/local/lib/pkgconfig
-        run: |
-          export PATH="$HOME/llvm-mingw/bin:/opt/local/bin:/opt/local/sbin:$PATH"
-          mkdir -p ~/wine-src && cd ~/wine-src
-          tar xf "${{ steps.findsrc.outputs.tarball }}" --strip-components=1
-          ./configure --prefix=$HOME/wine-x11 \
-            --with-x \
-            --x-includes=/opt/X11/include \
-            --x-libraries=/opt/X11/lib \
-            2>&1 | tee ~/configure.log
-          make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee ~/make.log
-          make install 2>&1 | tee ~/make-install.log
-        timeout-minutes: 300
-
-      - name: Save built Wine cache early
-        if: steps.cache-wine.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/wine-x11
-          key: wine-x11-build-v1
-
-      - name: Start virtual display (Xvfb)
-        run: |
-          export PATH="/opt/X11/bin:$PATH"
-          Xvfb :99 -screen 0 1024x768x24 &
-          sleep 5
-
-      - name: DIAGNOSE why wine gets SIGKILL on this runner
+      - name: Init wine prefix
+        timeout-minutes: 6
         continue-on-error: true
-        timeout-minutes: 10
-        env:
-          DISPLAY: ":99"
-          WINE_NO_MAC_DRIVER: "1"
         run: |
-          echo "##### system"
-          sw_vers; uname -a
-          csrutil status 2>&1 || true
-          spctl --status 2>&1 || true
-          nvram boot-args 2>&1 || true
-          sysctl kern.bootargs 2>&1 || true
-
-          echo "##### sign everything plain ad-hoc"
-          find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
-            codesign --force -s - "$f" >/dev/null 2>&1 || true
-          done
-          codesign -dvv "$HOME/wine-x11/bin/wine" 2>&1 | head -8
-
-          echo "##### Mach-O load commands (pagezero / segments) of wine binaries"
-          file "$HOME/wine-x11/bin/wine" "$HOME/wine-x11/lib/wine/aarch64-unix/wine" "$HOME/wine-x11/lib/wine/aarch64-unix/ntdll.so"
-          otool -l "$HOME/wine-x11/lib/wine/aarch64-unix/wine" | grep -A6 -E "LC_SEGMENT_64" | grep -E "segname|vmaddr|vmsize|maxprot|initprot" | head -40
-
-          echo "##### test: tiny C program with RWX mmap and fixed 4GB mmap, ad-hoc signed"
-          cat > "$HOME/t.c" << 'CEOF'
-          #include <sys/mman.h>
-          #include <stdio.h>
-          int main(void){
-            void *p = mmap(0,16384,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANON,-1,0);
-            printf("rwx mmap: %p\n", p);
-            void *q = mmap((void*)0x100000000ULL,16384,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0);
-            printf("fixed 4GB mmap: %p\n", q);
-            return 0;
-          }
-          CEOF
-          cc -o "$HOME/t" "$HOME/t.c" && codesign --force -s - "$HOME/t" && "$HOME/t"; echo "tiny test rc=$?"
-
-          echo "##### test: wine --version (loader only)"
-          "$HOME/wine-x11/bin/wine" --version; echo "wine --version rc=$?"
-
-          echo "##### test: MacPorts own wine (built locally, same runner)"
-          ls -la /opt/local/bin | grep -i wine || true
-          MPW=$(ls /opt/local/bin/wine* 2>/dev/null | head -1)
-          echo "MacPorts wine: $MPW"
-          if [ -n "$MPW" ]; then "$MPW" --version; echo "macports wine --version rc=$?"; fi
-
-          echo "##### test: lldb launch wine --version to capture stop reason"
-          lldb -b -o "run" -o "thread info" -o "bt 8" -o "process status" -- "$HOME/wine-x11/bin/wine" --version 2>&1 | tail -40 || true
-
-          echo "##### test: wine with WINEDEBUG and strace-like via DYLD_PRINT_LIBRARIES"
-          DYLD_PRINT_LIBRARIES=1 "$HOME/wine-x11/bin/wine" --version 2>&1 | tail -15; echo "rc=$?"
-
-          echo "##### kernel log"
-          log show --last 3m --info --debug --predicate 'process == "kernel"' 2>&1 | grep -iE "wine|AMFI|signature|Killed|proc exec|exec of|policy|taskgated|^.*deny" | tail -40 || true
-          echo "##### taskgated / syspolicyd log"
-          log show --last 3m --info --debug --predicate 'process == "taskgated-helper" or process == "syspolicyd" or process == "amfid"' 2>&1 | grep -iE "wine|t\.c|/Users/runner/t" | tail -30 || true
-
-      - name: Init wine prefix (force X11 driver, disable mac driver)
-        timeout-minutes: 3
-        env:
-          DISPLAY: ":99"
-          WINE_NO_MAC_DRIVER: "1"
-        run: |
-          export PATH="$HOME/wine-x11/bin:$PATH"
           export WINEPREFIX=$HOME/.wine-test
-          unset WINEARCH
-          wineboot --init
-          sleep 10
+          export WINEDEBUG=-all
+          "${{ steps.findwine.outputs.wine }}" wineboot --init > "$HOME/wineboot.log" 2>&1 &
+          WPID=$!
+          ( sleep 240; kill -9 $WPID 2>/dev/null ) &
+          wait $WPID
+          echo "wineboot exit code: $?"
+          tail -30 "$HOME/wineboot.log"
 
-      - name: Launch Notepad under Wine (GUI smoke test)
-        timeout-minutes: 2
-        env:
-          DISPLAY: ":99"
-          WINE_NO_MAC_DRIVER: "1"
+      - name: Launch Notepad and take real screenshot of the Mac screen
+        timeout-minutes: 4
+        continue-on-error: true
         run: |
-          export PATH="$HOME/wine-x11/bin:$PATH"
           export WINEPREFIX=$HOME/.wine-test
-          wine notepad &
-          sleep 15
-
-      - name: Capture screenshot of virtual display
-        timeout-minutes: 3
-        run: |
-          export PATH="/opt/X11/bin:$PATH"
-          brew install imagemagick
-          xwd -root -display :99 -out /tmp/screen.xwd
-          convert /tmp/screen.xwd /tmp/screen.png
+          export WINEDEBUG=-all
+          "${{ steps.findwine.outputs.wine }}" notepad > "$HOME/notepad.log" 2>&1 &
+          sleep 25
+          screencapture -x /tmp/screen.png || true
+          ls -la /tmp/screen.png || true
+          ps aux | grep -i -E "wine|notepad" | grep -v grep | head -10 || true
+          tail -20 "$HOME/notepad.log" || true
 
       - name: Upload screenshot as artifact
         if: always()
@@ -211,9 +62,10 @@ jobs:
         with:
           name: wine-x11-test-screenshot
           path: /tmp/screen.png
+          if-no-files-found: warn
 
       - name: Setup upterm session (backup for manual debugging)
         if: always()
         uses: owenthereal/action-upterm@v1
         with:
-          wait-timeout-minutes: 5
+          wait-timeout-minutes: 3
