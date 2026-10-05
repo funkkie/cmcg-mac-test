@@ -6,7 +6,14 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 40
     steps:
-      - name: Install Wine (Game Porting Toolkit build, the one that passed the Notepad test)
+      - uses: actions/checkout@v4
+
+      - name: Show uploaded program files
+        run: |
+          ls -la app/
+          for f in app/*.exe app/*.dll; do [ -f "$f" ] && file "$f"; done
+
+      - name: Install Wine (Game Porting Toolkit build)
         timeout-minutes: 20
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
@@ -23,37 +30,29 @@ jobs:
           export WINEDEBUG=-all
           wine64 wineboot --init
 
-      - name: Build a 32-bit Windows test program (PE32) from source
-        timeout-minutes: 10
-        run: |
-          brew install mingw-w64
-          cat > test32.c << 'CEOF'
-          #include <windows.h>
-          #include <stdio.h>
-          int main(void) {
-            const char *dlls[] = {"advapi32.dll","comctl32.dll","gdi32.dll","gdiplus.dll","kernel32.dll","ole32.dll","oleaut32.dll","olepro32.dll","shell32.dll","user32.dll","version.dll","wsock32.dll"};
-            int i;
-            printf("32-bit test program running under Wine");
-            putchar(10);
-            printf("pointer size = %d bytes", (int)sizeof(void*));
-            putchar(10);
-            printf("GetVersion = 0x%lx", (unsigned long)GetVersion());
-            putchar(10);
-            for (i = 0; i < 12; i++) {
-              HMODULE h = LoadLibraryA(dlls[i]);
-              printf("%s: %s", dlls[i], h ? "loaded" : "FAILED");
-              putchar(10);
-            }
-            return 0;
-          }
-          CEOF
-          i686-w64-mingw32-gcc -o test32.exe test32.c
-          file test32.exe
-
-      - name: Run the 32-bit program under Wine
-        timeout-minutes: 4
+      - name: Run Login.exe under Wine, screenshot the Mac screen
+        timeout-minutes: 6
+        continue-on-error: true
         run: |
           export WINEPREFIX=$HOME/.wine-test
-          export WINEDEBUG=-all
-          wine64 test32.exe 2>&1 | tee test32.log
-          echo "exit status: ${PIPESTATUS[0]}"
+          export WINEDEBUG=err+all
+          cd app
+          wine64 Login.exe > "$HOME/login-wine.log" 2>&1 &
+          sleep 30
+          echo "--- is Login.exe still running? ---"
+          ps aux | grep -i -E "Login.exe" | grep -v grep || echo "NOT RUNNING (exited or crashed)"
+          screencapture -x /tmp/login-screen.png || true
+          ls -la /tmp/login-screen.png || true
+          echo "--- last 80 lines of Wine log ---"
+          tail -80 "$HOME/login-wine.log" || true
+          cp "$HOME/login-wine.log" /tmp/login-wine.log || true
+
+      - name: Upload screenshot and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: login-test-result
+          path: |
+            /tmp/login-screen.png
+            /tmp/login-wine.log
+          if-no-files-found: warn
