@@ -20,7 +20,17 @@ jobs:
         run: |
           brew tap gcenx/wine
           brew trust gcenx/wine || true
-          brew install --cask gcenx/wine/wine-stable || brew install --cask gcenx/wine/wine@staging
+          TAPDIR=$(brew --repository gcenx/wine)
+          echo "=== files in tap ==="
+          find "$TAPDIR" -name "*.rb" -not -path "*/.git/*" | head -40
+          echo "=== brew search ==="
+          brew search --casks wine || true
+          CASKFILE=$(find "$TAPDIR" -name "*.rb" -not -path "*/.git/*" | grep -i "stable" | head -1)
+          if [ -z "$CASKFILE" ]; then CASKFILE=$(find "$TAPDIR" -name "*.rb" -not -path "*/.git/*" | grep -i wine | head -1); fi
+          echo "chosen cask file: $CASKFILE"
+          CASKNAME=$(basename "$CASKFILE" .rb)
+          echo "installing cask: gcenx/wine/$CASKNAME"
+          brew install --cask "gcenx/wine/$CASKNAME"
           ls /Applications | grep -i wine || true
           sudo xattr -dr com.apple.quarantine /Applications/Wine*.app || true
 
