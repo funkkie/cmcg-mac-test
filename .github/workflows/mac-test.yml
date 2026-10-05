@@ -13,10 +13,14 @@ jobs:
           sysctl -n machdep.cpu.brand_string
           csrutil status || true
 
-      - name: Install Wine (prebuilt x86_64 Mac build from Homebrew)
+      - name: Install Wine (prebuilt x86_64 Mac build from Gcenx tap)
         timeout-minutes: 20
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
         run: |
-          brew install --cask gcenx/wine/wine-stable || brew install --cask wine-stable
+          brew tap gcenx/wine
+          brew trust gcenx/wine || true
+          brew install --cask gcenx/wine/wine-stable || brew install --cask gcenx/wine/wine@staging
           ls /Applications | grep -i wine || true
           sudo xattr -dr com.apple.quarantine /Applications/Wine*.app || true
 
