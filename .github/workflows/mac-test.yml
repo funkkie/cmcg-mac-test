@@ -4,83 +4,56 @@ on: workflow_dispatch
 jobs:
   test:
     runs-on: macos-15-intel
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
-      - name: Machine info
-        run: |
-          sw_vers
-          uname -m
-          sysctl -n machdep.cpu.brand_string
-          csrutil status || true
-
-      - name: Install Wine (prebuilt x86_64 Mac build from Gcenx tap)
+      - name: Install Wine (Game Porting Toolkit build, the one that passed the Notepad test)
         timeout-minutes: 20
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
         run: |
           brew tap gcenx/wine
           brew trust gcenx/wine || true
-          TAPDIR=$(brew --repository gcenx/wine)
-          echo "=== files in tap ==="
-          find "$TAPDIR" -name "*.rb" -not -path "*/.git/*" | head -40
-          echo "=== brew search ==="
-          brew search --casks wine || true
-          CASKFILE=$(find "$TAPDIR" -name "*.rb" -not -path "*/.git/*" | grep -i "stable" | head -1)
-          if [ -z "$CASKFILE" ]; then CASKFILE=$(find "$TAPDIR" -name "*.rb" -not -path "*/.git/*" | grep -i wine | head -1); fi
-          echo "chosen cask file: $CASKFILE"
-          CASKNAME=$(basename "$CASKFILE" .rb)
-          echo "installing cask: gcenx/wine/$CASKNAME"
-          brew install --cask "gcenx/wine/$CASKNAME"
-          ls /Applications | grep -i wine || true
-          sudo xattr -dr com.apple.quarantine /Applications/Wine*.app || true
-
-      - name: Locate wine binary and check version
-        id: findwine
-        timeout-minutes: 3
-        run: |
-          WINE=$(ls -d /Applications/Wine*.app/Contents/Resources/wine/bin/wine 2>/dev/null | head -1)
-          if [ -z "$WINE" ]; then WINE=$(which wine64 || which wine || true); fi
-          echo "wine binary: $WINE"
-          file "$WINE"
-          "$WINE" --version
-          echo "wine=$WINE" >> "$GITHUB_OUTPUT"
+          brew install --cask gcenx/wine/game-porting-toolkit
+          wine64 --version
 
       - name: Init wine prefix
         timeout-minutes: 6
-        continue-on-error: true
         run: |
           export WINEPREFIX=$HOME/.wine-test
           export WINEDEBUG=-all
-          "${{ steps.findwine.outputs.wine }}" wineboot --init > "$HOME/wineboot.log" 2>&1 &
-          WPID=$!
-          ( sleep 240; kill -9 $WPID 2>/dev/null ) &
-          wait $WPID
-          echo "wineboot exit code: $?"
-          tail -30 "$HOME/wineboot.log"
+          wine64 wineboot --init
 
-      - name: Launch Notepad and take real screenshot of the Mac screen
+      - name: Build a 32-bit Windows test program (PE32) from source
+        timeout-minutes: 10
+        run: |
+          brew install mingw-w64
+          cat > test32.c << 'CEOF'
+          #include <windows.h>
+          #include <stdio.h>
+          int main(void) {
+            const char *dlls[] = {"advapi32.dll","comctl32.dll","gdi32.dll","gdiplus.dll","kernel32.dll","ole32.dll","oleaut32.dll","olepro32.dll","shell32.dll","user32.dll","version.dll","wsock32.dll"};
+            int i;
+            printf("32-bit test program running under Wine");
+            putchar(10);
+            printf("pointer size = %d bytes", (int)sizeof(void*));
+            putchar(10);
+            printf("GetVersion = 0x%lx", (unsigned long)GetVersion());
+            putchar(10);
+            for (i = 0; i < 12; i++) {
+              HMODULE h = LoadLibraryA(dlls[i]);
+              printf("%s: %s", dlls[i], h ? "loaded" : "FAILED");
+              putchar(10);
+            }
+            return 0;
+          }
+          CEOF
+          i686-w64-mingw32-gcc -o test32.exe test32.c
+          file test32.exe
+
+      - name: Run the 32-bit program under Wine
         timeout-minutes: 4
-        continue-on-error: true
         run: |
           export WINEPREFIX=$HOME/.wine-test
           export WINEDEBUG=-all
-          "${{ steps.findwine.outputs.wine }}" notepad > "$HOME/notepad.log" 2>&1 &
-          sleep 25
-          screencapture -x /tmp/screen.png || true
-          ls -la /tmp/screen.png || true
-          ps aux | grep -i -E "wine|notepad" | grep -v grep | head -10 || true
-          tail -20 "$HOME/notepad.log" || true
-
-      - name: Upload screenshot as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wine-x11-test-screenshot
-          path: /tmp/screen.png
-          if-no-files-found: warn
-
-      - name: Setup upterm session (backup for manual debugging)
-        if: always()
-        uses: owenthereal/action-upterm@v1
-        with:
-          wait-timeout-minutes: 3
+          wine64 test32.exe 2>&1 | tee test32.log
+          echo "exit status: ${PIPESTATUS[0]}"
