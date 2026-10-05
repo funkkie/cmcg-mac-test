@@ -10,8 +10,8 @@ jobs:
 
       - name: Show uploaded program files
         run: |
-          ls -la app/
-          for f in app/*.exe app/*.dll; do [ -f "$f" ] && file "$f"; done
+          ls -la .
+          for f in ./*.exe ./*.dll; do [ -f "$f" ] && file "$f"; done
 
       - name: Install Wine (Game Porting Toolkit build)
         timeout-minutes: 20
@@ -36,7 +36,7 @@ jobs:
         run: |
           export WINEPREFIX=$HOME/.wine-test
           export WINEDEBUG=err+all
-          cd app
+          cd "$GITHUB_WORKSPACE"
           wine64 Login.exe > "$HOME/login-wine.log" 2>&1 &
           sleep 30
           echo "--- is Login.exe still running? ---"
