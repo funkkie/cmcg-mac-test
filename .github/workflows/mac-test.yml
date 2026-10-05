@@ -11,10 +11,10 @@ jobs:
 
       - name: Cache MacPorts + deps
         id: cache-macports
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: /opt/local
-          key: macports-wine-x11-v1
+          key: macports-wine-x11-v2
 
       - name: Install MacPorts
         if: steps.cache-macports.outputs.cache-hit != 'true'
@@ -28,6 +28,13 @@ jobs:
           export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
           sudo port -N install wine bison flex pkgconfig
         timeout-minutes: 300
+
+      - name: Save MacPorts cache early (so later failures do not lose it)
+        if: steps.cache-macports.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/local
+          key: macports-wine-x11-v2
 
       - name: Ensure build tools present (cache-hit path)
         if: steps.cache-macports.outputs.cache-hit == 'true'
@@ -89,71 +96,19 @@ jobs:
           make install 2>&1 | tee ~/make-install.log
         timeout-minutes: 300
 
-      - name: Create local self-signed code-signing identity
-        id: cert
-        timeout-minutes: 3
+      - name: Start virtual display (Xvfb)
         run: |
-          KEYCHAIN="$HOME/sign.keychain-db"
-          PASSWORD="actions"
-          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          export PATH="/opt/X11/bin:$PATH"
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 5
 
-          cat > "$HOME/csr.cnf" << 'CNF_EOF'
-          [req]
-          distinguished_name = dn
-          x509_extensions = ext
-          prompt = no
-          [dn]
-          CN = WineLocalSigning
-          [ext]
-          basicConstraints=critical,CA:true
-          keyUsage=critical,keyCertSign,digitalSignature
-          extendedKeyUsage=critical,codeSigning
-          CNF_EOF
-
-          openssl req -x509 -newkey rsa:2048 -keyout "$HOME/signkey.pem" -out "$HOME/signcert.pem" -days 3650 -nodes -config "$HOME/csr.cnf"
-          openssl pkcs12 -export -out "$HOME/signcert.p12" -inkey "$HOME/signkey.pem" -in "$HOME/signcert.pem" -passout "pass:$PASSWORD" -legacy 2>/dev/null || \
-            openssl pkcs12 -export -out "$HOME/signcert.p12" -inkey "$HOME/signkey.pem" -in "$HOME/signcert.pem" -passout "pass:$PASSWORD"
-
-          security import "$HOME/signcert.p12" -k "$KEYCHAIN" -P "$PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
-
-          # Mark the cert as trusted for code signing, scoped to THIS keychain only (no -d flag,
-          # so this writes a per-keychain trust record in the USER trust domain, not the admin/
-          # default domain). The -d variant is what popped an un-answerable GUI auth prompt and
-          # hung runs #19 and #21; this unflagged form does not touch system trust settings and
-          # should not require authorization. Guarded by the step's 3-minute timeout regardless,
-          # in case this assumption is wrong on this runner.
-          security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$HOME/signcert.pem" || \
-            echo "WARNING: add-trusted-cert (user domain) failed or was not permitted; continuing anyway"
-
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$KEYCHAIN"
-
-          EXISTING=$(security list-keychains -d user | tr -d '"')
-          security list-keychains -d user -s "$KEYCHAIN" $EXISTING
-
-          echo "=== find-identity (codesigning) ==="
-          security find-identity -v -p codesigning "$KEYCHAIN"
-
-          IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep "WineLocalSigning" | head -1 | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([A-F0-9]+)[[:space:]].*/\1/')
-          if [ -z "$IDENTITY_HASH" ]; then
-            echo "find-identity -p codesigning still found nothing; trying find-identity -v (no policy filter) instead."
-            IDENTITY_HASH=$(security find-identity -v "$KEYCHAIN" | grep "WineLocalSigning" | head -1 | sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([A-F0-9]+)[[:space:]].*/\1/')
-          fi
-          if [ -z "$IDENTITY_HASH" ]; then
-            echo "ERROR: could not find WineLocalSigning identity hash via find-identity"
-            echo "Falling back to signing directly with the certificate's SHA-1 hash instead."
-            IDENTITY_HASH=$(openssl x509 -in "$HOME/signcert.pem" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
-            echo "Fallback SHA-1: $IDENTITY_HASH"
-          fi
-          echo "Using identity hash: $IDENTITY_HASH"
-          echo "identity=$IDENTITY_HASH" >> "$GITHUB_OUTPUT"
-          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
-
-      - name: Code-sign Wine binaries (self-signed identity + entitlements on main executables only, ad-hoc on libraries)
-        timeout-minutes: 5
+      - name: Try several code-signing strategies, keep the first where wineboot works
+        timeout-minutes: 20
+        env:
+          DISPLAY: ":99"
+          WINE_NO_MAC_DRIVER: "1"
         run: |
-          cat > "$HOME/wine-entitlements.plist" << 'PLIST_EOF'
+          cat > "$HOME/ents-full.plist" << 'PLIST_EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -166,25 +121,67 @@ jobs:
           </dict>
           </plist>
           PLIST_EOF
-          IDENTITY="${{ steps.cert.outputs.identity }}"
-          KEYCHAIN="${{ steps.cert.outputs.keychain }}"
-          echo "Signing with identity: $IDENTITY (keychain: $KEYCHAIN)"
-          EXECCOUNT=0
-          LIBCOUNT=0
-          while IFS= read -r -d '' f; do
-            TYPE=$(file -b "$f" 2>/dev/null)
-            if echo "$TYPE" | grep -q "executable"; then
-              codesign --options runtime --entitlements "$HOME/wine-entitlements.plist" --force -s "$IDENTITY" --keychain "$KEYCHAIN" "$f" 2>&1 | grep -v "replacing existing signature" || true
-              EXECCOUNT=$((EXECCOUNT+1))
-            else
-              codesign --options runtime --force -s "$IDENTITY" --keychain "$KEYCHAIN" "$f" 2>&1 | grep -v "replacing existing signature" || true
-              LIBCOUNT=$((LIBCOUNT+1))
+
+          sign_all() {
+            MODE="$1"
+            find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
+              TYPE=$(file -b "$f" 2>/dev/null)
+              ISEXEC=0
+              if echo "$TYPE" | grep -q "executable"; then ISEXEC=1; fi
+              case "$MODE" in
+                plain)
+                  codesign --force -s - "$f" >/dev/null 2>&1 || true ;;
+                ents_noruntime)
+                  if [ "$ISEXEC" = "1" ]; then
+                    codesign --force --entitlements "$HOME/ents-full.plist" -s - "$f" >/dev/null 2>&1 || true
+                  else
+                    codesign --force -s - "$f" >/dev/null 2>&1 || true
+                  fi ;;
+                ents_runtime)
+                  if [ "$ISEXEC" = "1" ]; then
+                    codesign --force --options runtime --entitlements "$HOME/ents-full.plist" -s - "$f" >/dev/null 2>&1 || true
+                  else
+                    codesign --force -s - "$f" >/dev/null 2>&1 || true
+                  fi ;;
+              esac
+            done
+          }
+
+          try_wine() {
+            export PATH="$HOME/wine-x11/bin:$PATH"
+            export WINEPREFIX="$HOME/.wine-try"
+            rm -rf "$WINEPREFIX"
+            unset WINEARCH
+            wineboot --init > "$HOME/wineboot-try.log" 2>&1 &
+            WPID=$!
+            ( sleep 150; kill -9 $WPID 2>/dev/null ) &
+            WD=$!
+            wait $WPID
+            RC=$?
+            kill $WD 2>/dev/null
+            echo "wineboot exit code: $RC"
+            tail -20 "$HOME/wineboot-try.log"
+            return $RC
+          }
+
+          CHOSEN=""
+          for MODE in plain ents_noruntime ents_runtime; do
+            echo "=================== STRATEGY: $MODE ==================="
+            sign_all "$MODE"
+            codesign -dvv "$HOME/wine-x11/bin/wine" 2>&1 | head -12 || true
+            if try_wine; then
+              echo "SUCCESS with strategy: $MODE"
+              CHOSEN="$MODE"
+              break
             fi
-          done < <(find "$HOME/wine-x11" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
-          echo "Signed $EXECCOUNT main executables WITH entitlements (identity: $IDENTITY)."
-          echo "Signed $LIBCOUNT libraries/builtin-dlls WITHOUT entitlements."
-          echo "Verifying wine signature (need a real cert chain now, not adhoc):"
-          codesign -dvvv "$HOME/wine-x11/bin/wine" 2>&1 || true
+            echo "--- strategy $MODE failed; kernel/amfid log: ---"
+            log show --last 2m --info --debug --predicate 'process == "amfid" or process == "taskgated-helper" or eventMessage contains[c] "constraint violation" or eventMessage contains[c] "wine"' 2>&1 | grep -iE "wine|violation|not valid|disallow|AMFI" | tail -25 || true
+          done
+          if [ -z "$CHOSEN" ]; then
+            echo "ERROR: no signing strategy let wineboot run"
+            exit 1
+          fi
+          echo "Chosen strategy: $CHOSEN"
 
       - name: Upload build logs (always, for debugging)
         if: always()
@@ -195,12 +192,7 @@ jobs:
             ~/configure.log
             ~/make.log
             ~/make-install.log
-
-      - name: Start virtual display (Xvfb)
-        run: |
-          export PATH="/opt/X11/bin:$PATH"
-          Xvfb :99 -screen 0 1024x768x24 &
-          sleep 5
+            ~/wineboot-try.log
 
       - name: Init wine prefix (force X11 driver, disable mac driver)
         timeout-minutes: 3
@@ -211,16 +203,7 @@ jobs:
           export PATH="$HOME/wine-x11/bin:$PATH"
           export WINEPREFIX=$HOME/.wine-test
           unset WINEARCH
-          set +e
           wineboot --init
-          STATUS=$?
-          set -e
-          echo "wineboot exit status: $STATUS"
-          if [ "$STATUS" -ne 0 ]; then
-            echo "=== Recent unified system log mentioning wine / amfid / constraint violation / certificate chain (last 3 min) ==="
-            log show --last 3m --info --debug --predicate 'eventMessage contains[c] "wine" or process == "amfid" or eventMessage contains[c] "amfid" or eventMessage contains[c] "constraint violation" or eventMessage contains[c] "certificate chain"' 2>&1 | tail -300 || echo "log show produced nothing or failed"
-            exit $STATUS
-          fi
           sleep 10
 
       - name: Launch Notepad under Wine (GUI smoke test)
